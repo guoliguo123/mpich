@@ -27,118 +27,67 @@ int MPIR_TSP_Iallgatherv_sched_intra_ring(const void *sendbuf, int sendcount,
                                           MPI_Datatype recvtype, MPIR_Comm * comm,
                                           MPIR_TSP_sched_t * sched)
 {
-    size_t extent;
-    MPI_Aint lb, true_extent;
     int mpi_errno = MPI_SUCCESS;
-    int i, src, dst;
-    int nranks, is_inplace, rank;
-    int nvtcs, vtcs[3], send_id[3], recv_id[3], dtcopy_id[3];
-    int send_rank, recv_rank;
-    void *data_buf, *buf1, *buf2, *sbuf, *rbuf;
-    int max_count;
+    int size, is_inplace, rank;
+    int i, j, jnext, left, right;
+    int recv_id = -1;
+    int vtcs[2], r_vtcs[3];
+    int nvtcs = 0;
     int tag;
+
+    size_t recvtype_lb, recvtype_extent;
+    size_t recvtype_true_extent;
 
     MPIR_FUNC_VERBOSE_STATE_DECL(MPID_STATE_MPIR_TSP_IALLGATHERV_SCHED_INTRA_RING);
     MPIR_FUNC_VERBOSE_ENTER(MPID_STATE_MPIR_TSP_IALLGATHERV_SCHED_INTRA_RING);
 
     is_inplace = (sendbuf == MPI_IN_PLACE);
-    nranks = MPIR_Comm_size(comm);
+    size = MPIR_Comm_size(comm);
     rank = MPIR_Comm_rank(comm);
 
     /* find out the buffer which has the send data and point data_buf to it */
     if (is_inplace) {
         sendcount = recvcounts[rank];
         sendtype = recvtype;
-        data_buf = (char *) recvbuf;
-    } else
-        data_buf = (char *) sendbuf;
-
-    MPIR_Datatype_get_extent_macro(recvtype, extent);
-    MPIR_Type_get_true_extent_impl(recvtype, &lb, &true_extent);
-    extent = MPL_MAX(extent, true_extent);
-
-    max_count = recvcounts[0];
-    for (i = 1; i < nranks; i++) {
-        if (recvcounts[i] > max_count)
-            max_count = recvcounts[i];
     }
 
-    /* allocate space for temporary buffers to accommodate the largest recvcount */
-    buf1 = MPIR_TSP_sched_malloc(max_count * extent, sched);
-    buf2 = MPIR_TSP_sched_malloc(max_count * extent, sched);
+    MPIR_Datatype_get_extent_macro(recvtype, recvtype_extent);
+    MPIR_Type_get_true_extent_impl(recvtype, &recvtype_lb, &recvtype_true_extent);
+    recvtype_extent = MPL_MAX(recvtype_extent, recvtype_true_extent);
 
-    /* Phase 1: copy data to buf1 from sendbuf or recvbuf(in case of inplace) */
-    if (is_inplace) {
-        dtcopy_id[0] =
-            MPIR_TSP_sched_localcopy((char *) data_buf + displs[rank] * extent, sendcount, sendtype,
-                                     buf1, recvcounts[rank], recvtype, sched, 0, NULL);
-    } else {
+    if (!is_inplace) {
         /* copy your data into your recvbuf from your sendbuf */
-        MPIR_TSP_sched_localcopy(sendbuf, sendcount, sendtype,
-                                 (char *) recvbuf + displs[rank] * extent, recvcounts[rank],
-                                 recvtype, sched, 0, NULL);
-        /* copy data from sendbuf to tmp_sendbuf to send the data */
-        dtcopy_id[0] =
-            MPIR_TSP_sched_localcopy(sendbuf, sendcount, sendtype, buf1, recvcounts[rank], recvtype,
-                                     sched, 0, NULL);
+        vtcs[0] = MPIR_TSP_sched_localcopy((char *) sendbuf, sendcount, sendtype,
+                                           (char *) recvbuf + displs[rank] * recvtype_extent,
+                                           recvcounts[rank], recvtype, sched, 0, NULL);
+        nvtcs = 1;
     }
 
-    src = (nranks + rank - 1) % nranks;
-    dst = (rank + 1) % nranks;
+    left = (size + rank - 1) % size;
+    right = (rank + 1) % size;
 
-    sbuf = buf1;
-    rbuf = buf2;
+    j = rank;
+    jnext = left;
 
-    for (i = 0; i < nranks - 1; i++) {
-        recv_rank = (rank - i - 1 + nranks) % nranks;   /* Rank whose data you're receiving */
-        send_rank = (rank - i + nranks) % nranks;       /* Rank whose data you're sending */
-
+    for (i = 0; i < size - 1; i++) {
         /* New tag for each send-recv pair. */
         mpi_errno = MPIR_Sched_next_tag(comm, &tag);
         if (mpi_errno)
             MPIR_ERR_POP(mpi_errno);
 
-        if (i == 0) {
-            nvtcs = 1;
-            vtcs[0] = dtcopy_id[0];
-        } else {
-            nvtcs = 2;
-            vtcs[0] = recv_id[(i - 1) % 3];
-            vtcs[1] = send_id[(i - 1) % 3];
-        }
+        MPIR_TSP_sched_isend(((char *) recvbuf + displs[j] * recvtype_extent), recvcounts[j],
+                             recvtype, right, tag, comm, sched, nvtcs, vtcs);
 
-        send_id[i % 3] =
-            MPIR_TSP_sched_isend(sbuf, recvcounts[send_rank], recvtype, dst, tag, comm, sched,
-                                 nvtcs, vtcs);
+        recv_id =
+            MPIR_TSP_sched_irecv((char *) recvbuf + displs[jnext] * recvtype_extent,
+                                 recvcounts[jnext], recvtype, left, tag, comm, sched, i > 3 ? 1 : 0,
+                                 r_vtcs + i % 3);
+        r_vtcs[i % 3] = recv_id;
+        vtcs[0] = recv_id;
+        nvtcs = 1;
 
-
-        if (i == 0) {
-            nvtcs = 0;
-        } else if (i == 1) {
-            nvtcs = 2;
-            vtcs[0] = send_id[(i - 1) % 3];
-            vtcs[1] = recv_id[(i - 1) % 3];
-        } else {
-            nvtcs = 3;
-            vtcs[0] = send_id[(i - 1) % 3];
-            vtcs[1] = dtcopy_id[(i - 2) % 3];
-            vtcs[2] = recv_id[(i - 1) % 3];
-        }
-
-        recv_id[i % 3] =
-            MPIR_TSP_sched_irecv(rbuf, recvcounts[recv_rank], recvtype, src, tag, comm, sched,
-                                 nvtcs, vtcs);
-
-        /* Copy to correct position in recvbuf */
-        dtcopy_id[i % 3] =
-            MPIR_TSP_sched_localcopy(rbuf, recvcounts[recv_rank], recvtype,
-                                     (char *) recvbuf + displs[recv_rank] * extent,
-                                     recvcounts[recv_rank], recvtype, sched, 1, &recv_id[i % 3]);
-
-        data_buf = sbuf;
-        sbuf = rbuf;
-        rbuf = data_buf;
-
+        j = jnext;
+        jnext = (size + jnext - 1) % size;
     }
 
     MPIR_TSP_sched_fence(sched);
